@@ -206,20 +206,19 @@ def authenticate_msp():
     try:
         api_key = st.secrets.get("msp_api_key")
         if not api_key:
-            raise KeyError("msp_api_key not found")
+            return False
         
         client = MSPAPIClient(api_key)
         data, error = client.get_enboxes()
         
         if error:
-            st.error(f"❌ MSP Authentication failed: {error}")
+            st.sidebar.error(f"MSP Auth Error: {error[:50]}...")
             return False
         else:
             st.session_state.msp_api_key = api_key
-            st.session_state.msp_authenticated = True
             return True
-    except KeyError:
-        st.error("❌ MSP API key not found in secrets. Add 'msp_api_key' to .streamlit/secrets.toml")
+    except Exception as e:
+        st.sidebar.warning(f"MSP API key not configured")
         return False
 
 def authenticate_user():
@@ -227,20 +226,19 @@ def authenticate_user():
     try:
         api_key = st.secrets.get("user_api_key")
         if not api_key:
-            raise KeyError("user_api_key not found")
+            return False
         
         client = UserAPIClient(api_key)
         data, error = client.get_profile()
         
         if error:
-            st.error(f"❌ User Authentication failed: {error}")
+            st.sidebar.error(f"User Auth Error: {error[:50]}...")
             return False
         else:
             st.session_state.user_api_key = api_key
-            st.session_state.user_authenticated = True
             return True
-    except KeyError:
-        st.error("❌ User API key not found in secrets. Add 'user_api_key' to .streamlit/secrets.toml")
+    except Exception as e:
+        st.sidebar.warning(f"User API key not configured")
         return False
 
 # MSP Functions (from previous code)
@@ -541,6 +539,94 @@ def user_profile_page(client):
     with st.expander("📋 Full Profile JSON"):
         st.json(profile)
 
+def display_msp_statistics(client):
+    """Display MSP statistics"""
+    st.markdown('<div class="section-header">📊 MSP Statistics</div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🔄 Refresh", use_container_width=True):
+            pass
+    
+    with st.spinner("Loading statistics..."):
+        stats_data, stats_error = client.get_stats()
+        usage_data, usage_error = client.get_usage()
+    
+    if stats_error:
+        st.error(f"❌ Error loading stats: {stats_error}")
+    else:
+        stats = stats_data.get('stats', {})
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Enboxes", stats.get('total_enboxes', 0))
+        with col2:
+            st.metric("Active", stats.get('active_enboxes', 0))
+        with col3:
+            st.metric("Inactive", stats.get('inactive_enboxes', 0))
+        with col4:
+            st.metric("API Calls (24h)", stats.get('api_calls_24h', 0))
+        
+        with st.expander("📋 Full Stats Data"):
+            st.json(stats_data)
+    
+    if usage_error:
+        st.error(f"❌ Error loading usage: {usage_error}")
+    else:
+        st.markdown("---")
+        st.markdown("### 📈 API Usage (Last 24 Hours)")
+        
+        usage_stats = usage_data.get('usage', {})
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### By Action")
+            by_action = usage_stats.get('by_action', {})
+            if by_action:
+                action_df = pd.DataFrame([
+                    {"Action": k, "Count": v} for k, v in by_action.items()
+                ]).sort_values('Count', ascending=False)
+                st.dataframe(action_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No data")
+        
+        with col2:
+            st.markdown("#### By Status")
+            by_status = usage_stats.get('by_status', {})
+            if by_status:
+                status_df = pd.DataFrame([
+                    {"Status": k, "Count": v} for k, v in by_status.items()
+                ]).sort_values('Count', ascending=False)
+                st.dataframe(status_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No data")
+
+def display_labels(client):
+    """Display user labels"""
+    st.markdown('<div class="section-header">🏷️ Labels</div>', unsafe_allow_html=True)
+    
+    with st.spinner("Loading labels..."):
+        data, error = client.list_labels()
+    
+    if error:
+        st.error(f"❌ Error loading labels: {error}")
+        return
+    
+    labels = data.get('labels', []) if isinstance(data, dict) else []
+    
+    if not labels:
+        st.info("No custom labels found")
+        return
+    
+    st.metric("Total Labels", len(labels))
+    
+    for label in labels:
+        with st.expander(f"🏷️ {label.get('name', 'Unnamed')}"):
+            st.caption(f"ID: {label.get('id', 'N/A')}")
+            st.caption(f"Color: {label.get('color', 'N/A')}")
+            st.caption(f"Created: {label.get('created_at', 'N/A')[:10]}")
+
 def resolve_enbox_tool(client):
     """Tool to resolve Enbox IDs"""
     st.markdown('<div class="section-header">🔍 Resolve Enbox ID</div>', unsafe_allow_html=True)
@@ -567,72 +653,115 @@ def main():
     
     st.markdown('<div class="main-header">📧 Enbox Management Portal</div>', unsafe_allow_html=True)
     
-    # Mode selection
-    mode = st.radio(
-        "Select Mode",
-        ["MSP (Manage Enboxes)", "User (Email Management)"],
-        horizontal=True,
-        key="mode_selector"
-    )
+    # Authenticate both APIs
+    msp_client = None
+    user_client = None
     
-    if "MSP" in mode:
-        # MSP Mode
-        if not st.session_state.msp_authenticated:
-            if authenticate_msp():
-                st.rerun()
-            return
+    # Try to authenticate MSP
+    if not st.session_state.msp_authenticated:
+        if authenticate_msp():
+            st.session_state.msp_authenticated = True
+    
+    if st.session_state.msp_authenticated:
+        msp_client = MSPAPIClient(st.session_state.msp_api_key)
+    
+    # Try to authenticate User
+    if not st.session_state.user_authenticated:
+        if authenticate_user():
+            st.session_state.user_authenticated = True
+    
+    if st.session_state.user_authenticated:
+        user_client = UserAPIClient(st.session_state.user_api_key)
+    
+    # Sidebar with all available pages
+    with st.sidebar:
+        st.markdown("### 🔐 Authentication Status")
         
-        client = MSPAPIClient(st.session_state.msp_api_key)
-        
-        with st.sidebar:
-            st.success("✅ MSP Authenticated")
-            if st.button("🔓 Disconnect MSP"):
+        if st.session_state.msp_authenticated:
+            st.success("✅ MSP API Connected")
+            if st.button("🔓 Disconnect MSP", key="disconnect_msp"):
                 st.session_state.msp_authenticated = False
                 st.session_state.msp_api_key = None
                 st.rerun()
-            
-            st.markdown("---")
-            page = st.radio("MSP Pages", ["Dashboard", "Create Enbox", "Statistics"])
+        else:
+            st.warning("❌ MSP API Not Connected")
         
-        if page == "Dashboard":
-            display_enboxes_list(client)
-        elif page == "Create Enbox":
-            create_enbox_form(client)
-        elif page == "Statistics":
-            st.markdown('<div class="section-header">📊 Statistics</div>', unsafe_allow_html=True)
-            data, error = client.get_stats()
-            if error:
-                st.error(f"❌ Error: {error}")
-            else:
-                st.json(data)
-    
-    else:
-        # User Mode
-        if not st.session_state.user_authenticated:
-            if authenticate_user():
-                st.rerun()
-            return
-        
-        client = UserAPIClient(st.session_state.user_api_key)
-        
-        with st.sidebar:
-            st.success("✅ User Authenticated")
-            if st.button("🔓 Disconnect User"):
+        if st.session_state.user_authenticated:
+            st.success("✅ User API Connected")
+            if st.button("🔓 Disconnect User", key="disconnect_user"):
                 st.session_state.user_authenticated = False
                 st.session_state.user_api_key = None
                 st.rerun()
-            
-            st.markdown("---")
-            page = st.radio("User Pages", ["Inbox", "Send Email", "Profile", "Resolve Enbox"])
+        else:
+            st.warning("❌ User API Not Connected")
         
-        if page == "Inbox":
-            display_inbox(client)
-        elif page == "Send Email":
-            send_email_form(client)
-        elif page == "Profile":
-            user_profile_page(client)
-        elif page == "Resolve Enbox":
-            resolve_enbox_tool(client)
+        st.markdown("---")
+        st.markdown("### 📚 Navigation")
+        
+        # Build page list based on available APIs
+        pages = []
+        
+        # MSP Pages
+        if msp_client:
+            pages.extend([
+                "📦 MSP: Dashboard",
+                "➕ MSP: Create Enbox",
+                "📊 MSP: Statistics"
+            ])
+        
+        # User Pages
+        if user_client:
+            pages.extend([
+                "📬 User: Inbox",
+                "✉️ User: Send Email",
+                "👤 User: Profile",
+                "🔍 User: Resolve Enbox",
+                "🏷️ User: Labels"
+            ])
+        
+        if not pages:
+            st.error("⚠️ No APIs connected")
+            st.markdown("""
+            ### Configuration Required
+            
+            Add API keys to `.streamlit/secrets.toml`:
+            
+            ```toml
+            # MSP API (for Enbox management)
+            msp_api_key = "enbox_msp_your_key"
+            
+            # User API (for email management)  
+            user_api_key = "enbox_your_key"
+            ```
+            
+            You can configure one or both APIs.
+            """)
+            return
+        
+        page = st.radio("Select Page", pages, label_visibility="collapsed")
+        
+        st.markdown("---")
+        st.markdown("### ℹ️ About")
+        st.caption("Enbox Portal v2.0")
+        st.caption("MSP & User API Integration")
+    
+    # Route to appropriate page
+    if page == "📦 MSP: Dashboard":
+        display_enboxes_list(msp_client)
+    elif page == "➕ MSP: Create Enbox":
+        create_enbox_form(msp_client)
+    elif page == "📊 MSP: Statistics":
+        display_msp_statistics(msp_client)
+    elif page == "📬 User: Inbox":
+        display_inbox(user_client)
+    elif page == "✉️ User: Send Email":
+        send_email_form(user_client)
+    elif page == "👤 User: Profile":
+        user_profile_page(user_client)
+    elif page == "🔍 User: Resolve Enbox":
+        resolve_enbox_tool(user_client)
+    elif page == "🏷️ User: Labels":
+        display_labels(user_client)
 
 if __name__ == "__main__":
     main()
